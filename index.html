@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <title>Sandbox Online: Survival</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background: #111; }
+        #ui { position: absolute; width: 100%; height: 100%; pointer-events: none; z-index: 5; display: none; }
+        
+        /* HP Bar */
+        #hp-container { position: absolute; top: 20px; left: 50%; transform: translateX(-50%); width: 200px; height: 20px; background: rgba(0,0,0,0.5); border: 2px solid white; border-radius: 10px; overflow: hidden; }
+        #hp-bar { width: 100%; height: 100%; background: #e74c3c; transition: 0.3s; }
+        
+        /* Death Screen */
+        #death-screen { position: absolute; width: 100%; height: 100%; background: rgba(255,0,0,0.5); display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 200; color: white; }
+        
+        #login-screen { position: absolute; width: 100%; height: 100%; background: #1a1a1a; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; color: white; pointer-events: all; }
+        input { padding: 12px; margin: 10px; width: 250px; text-align: center; border-radius: 8px; border: none; }
+        button { padding: 12px 40px; cursor: pointer; background: #27ae60; color: white; border: none; border-radius: 8px; font-weight: bold; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 8px; height: 8px; background: white; border-radius: 50%; transform: translate(-50%, -50%); }
+        #hotbar { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 15px; pointer-events: all; }
+        .slot { width: 60px; height: 60px; border: 2px solid #444; margin: 0 5px; display: flex; align-items: center; justify-content: center; color: white; font-size: 10px; border-radius: 8px; }
+        .active { border-color: #00ff00; background: rgba(0, 255, 0, 0.2); }
+        #info { position: absolute; top: 10px; right: 10px; color: white; font-size: 12px; }
+    </style>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+<div id="death-screen">
+    <h1>ТИ ЗАГИНУВ</h1>
+    <p>Відродження через <span id="respawn-timer">5</span> сек...</p>
+</div>
+
+<div id="login-screen">
+    <h1>SANDBOX SURVIVAL</h1>
+    <input type="text" id="nick" placeholder="Твій нік...">
+    <input type="text" id="remoteId" placeholder="ID хоста (якщо приєднуєшся)">
+    <button onclick="enterGame(false)">СТВОРИТИ СВЕРВЕР</button>
+    <button onclick="enterGame(true)" style="background:#2980b9">ПРИЄДНАТИСЯ</button>
+</div>
+
+<div id="ui">
+    <div id="info">ID: <span id="my-id">...</span></div>
+    <div id="hp-container"><div id="hp-bar"></div></div>
+    <div id="crosshair"></div>
+    <div id="hotbar">
+        <div class="slot active">🔫</div>
+        <div class="slot">📦</div>
+        <div class="slot">💃</div>
+    </div>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+let scene, camera, renderer, controls, pistol;
+let hp = 100;
+let isDead = false;
+let currentSlot = 0;
+const colliders = [];
+const otherPlayers = {};
+let peer, conn;
+const keys = { w: false, a: false, s: false, d: false, space: false };
+let velocity = new THREE.Vector3();
+
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 2, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const sun = new THREE.DirectionalLight(0xffffff, 1); sun.position.set(50, 100, 50); scene.add(sun);
+
+    // Земля
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshLambertMaterial({ color: 0x348C31 }));
+    ground.rotation.x = -Math.PI / 2; scene.add(ground);
+
+    // Хмарки
+    for(let i=0; i<15; i++) createCloud(Math.random()*400-200, 50+Math.random()*20, Math.random()*400-200);
+
+    // Модель зброї
+    pistol = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.2, 0.4), new THREE.MeshLambertMaterial({ color: 0x222 }));
+    pistol.position.set(0.3, -0.3, -0.6);
+    camera.add(pistol); scene.add(camera);
+
+    controls = new PointerLockControls(camera, document.body);
+
+    window.addEventListener('keydown', (e) => { 
+        if(e.code === 'KeyW') keys.w = true; if(e.code === 'KeyS') keys.s = true;
+        if(e.code === 'KeyA') keys.a = true; if(e.code === 'KeyD') keys.d = true;
+        if(e.code === 'Space') keys.space = true;
+    });
+    window.addEventListener('keyup', (e) => {
+        if(e.code === 'KeyW') keys.w = false; if(e.code === 'KeyS') keys.s = false;
+        if(e.code === 'KeyA') keys.a = false; if(e.code === 'KeyD') keys.d = false;
+        if(e.code === 'Space') keys.space = false;
+    });
+
+    window.addEventListener('mousedown', (e) => {
+        if(!controls.isLocked || isDead) return;
+        if(e.button === 0) {
+            if(currentSlot === 0) shoot();
+            else spawnItem(['block', 'jenny'][currentSlot-1]);
+        }
+    });
+
+    animate();
+}
+
+function createCloud(x, y, z) {
+    const cloud = new THREE.Mesh(new THREE.SphereGeometry(5, 8, 8), new THREE.MeshLambertMaterial({color:0xffffff, transparent:true, opacity:0.8}));
+    cloud.position.set(x, y, z);
+    scene.add(cloud);
+}
+
+function shoot() {
+    // Ефект пострілу
+    pistol.position.z += 0.1;
+    setTimeout(() => pistol.position.z -= 0.1, 50);
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(new THREE.Vector2(0,0), camera);
+    
+    // Перевіряємо влучання в інших гравців
+    const targets = Object.values(otherPlayers);
+    const intersects = raycaster.intersectObjects(targets);
+
+    if(intersects.length > 0 && conn) {
+        conn.send({ type: 'damage', amount: 20 });
+    }
+}
+
+function takeDamage(amount) {
+    if(isDead) return;
+    hp -= amount;
+    document.getElementById('hp-bar').style.width = hp + "%";
+    if(hp <= 0) die();
+}
+
+function die() {
+    isDead = true;
+    controls.unlock();
+    document.getElementById('death-screen').style.display = 'flex';
+    
+    let timeLeft = 5;
+    const interval = setInterval(() => {
+        timeLeft--;
+        document.getElementById('respawn-timer').innerText = timeLeft;
+        if(timeLeft <= 0) {
+            clearInterval(interval);
+            respawn();
+        }
+    }, 1000);
+}
+
+function respawn() {
+    hp = 100;
+    isDead = false;
+    document.getElementById('hp-bar').style.width = "100%";
+    document.getElementById('death-screen').style.display = 'none';
+    camera.position.set(0, 2, 0);
+    controls.lock();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if(controls.isLocked && !isDead) {
+        const delta = 0.15;
+        if(keys.w) controls.moveForward(delta);
+        if(keys.s) controls.moveForward(-delta);
+        if(keys.a) controls.moveRight(-delta);
+        if(keys.d) controls.moveRight(delta);
+        
+        // Повідомляємо інших про рух
+        if(conn && conn.open) conn.send({ type: 'move', pos: camera.position, rot: camera.rotation.y });
+    }
+    renderer.render(scene, camera);
+}
+
+// Мережева частина (PeerJS)
+window.enterGame = (isClient) => {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('ui').style.display = 'block';
+    init();
+    
+    peer = new Peer();
+    peer.on('open', (id) => {
+        document.getElementById('my-id').innerText = id;
+        if(isClient) {
+            conn = peer.connect(document.getElementById('remoteId').value);
+            setupNetwork(conn);
+        }
+    });
+    peer.on('connection', (c) => {
+        conn = c;
+        setupNetwork(conn);
+    });
+};
+
+function setupNetwork(c) {
+    c.on('data', (data) => {
+        if(data.type === 'move') {
+            if(!otherPlayers[c.peer]) {
+                const m = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshLambertMaterial({color: 0xff0000}));
+                scene.add(m);
+                otherPlayers[c.peer] = m;
+            }
+            otherPlayers[c.peer].position.copy(data.pos);
+            otherPlayers[c.peer].rotation.y = data.rot;
+        }
+        if(data.type === 'damage') takeDamage(data.amount);
+    });
+}
+</script>
+</body>
+</html>
